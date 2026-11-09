@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feature Table</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#6b7385; --line:#e3e6ec; --accent:#2f6fed; --danger:#d64545; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width: 980px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .toolbar { display:flex; gap:10px; align-items:center; padding:12px 14px; border-bottom:1px solid var(--line); }
+  .toolbar input[type=search] { flex:1; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); background:#fafbfc; cursor:pointer; user-select:none; white-space:nowrap; }
+  th.noclick { cursor:default; }
+  tr:last-child td { border-bottom:none; }
+  td.id { color:var(--muted); width:60px; font-variant-numeric: tabular-nums; }
+  td.actions { width:150px; text-align:right; white-space:nowrap; }
+  tr.new td { background:#f3f7ff; }
+  input { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; width:100%; background:#fff; color:inherit; }
+  input:focus { outline:2px solid #c9d8fb; border-color:var(--accent); }
+  button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--line); background:#fff; color:var(--ink); cursor:pointer; }
+  button:hover { background:#f2f4f7; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { filter:brightness(1.05); }
+  button.danger { color:var(--danger); }
+  .empty { padding:28px; text-align:center; color:var(--muted); }
+  #msg { min-height:20px; margin:10px 2px; color:var(--danger); }
+  #msg.ok { color:#2a8a4a; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Feature Table</h1>
+  <p class="sub">View, add, edit and delete rows. Changes are saved straight to the server.</p>
+
+  <div class="card">
+    <div class="toolbar">
+      <input type="search" id="filter" placeholder="Filter by name or feature…">
+      <button class="primary" id="addBtn">+ Add row</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th data-sort="id">ID</th>
+          <th data-sort="date">Date</th>
+          <th data-sort="name">Name</th>
+          <th data-sort="feature">Feature</th>
+          <th class="noclick"></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div id="msg"></div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let rows = [], editing = null, adding = false, sortKey = "id", sortDir = 1;
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function today() { return new Date().toISOString().slice(0, 10); }
+function flash(text, ok) { const m = $("#msg"); m.textContent = text || ""; m.className = ok ? "ok" : ""; if (ok) setTimeout(() => { if (m.textContent === text) m.textContent = ""; }, 2000); }
+
+async function api(method, url, body) {
+  const res = await fetch(url, { method, headers: body ? {"Content-Type":"application/json"} : {}, body: body ? JSON.stringify(body) : undefined });
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function load() {
+  try { rows = await api("GET", "/api/rows"); render(); }
+  catch (e) { flash("Could not load rows: " + e.message); }
+}
+
+function editorCells(r) {
+  return `<td class="id">${r.id ?? "new"}</td>
+    <td><input type="date" name="date" value="${esc(r.date)}"></td>
+    <td><input name="name" value="${esc(r.name)}" placeholder="Name"></td>
+    <td><input name="feature" value="${esc(r.feature)}" placeholder="Feature"></td>
+    <td class="actions"><button class="primary" data-act="save">Save</button> <button data-act="cancel">Cancel</button></td>`;
+}
+
+function render() {
+  const q = $("#filter").value.trim().toLowerCase();
+  const list = rows
+    .filter(r => !q || r.name.toLowerCase().includes(q) || r.feature.toLowerCase().includes(q))
+    .sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
+
+  let html = "";
+  if (adding) html += `<tr class="new" data-id="">${editorCells({ date: today(), name: "", feature: "" })}</tr>`;
+  for (const r of list) {
+    html += editing === r.id
+      ? `<tr data-id="${r.id}">${editorCells(r)}</tr>`
+      : `<tr data-id="${r.id}">
+          <td class="id">${r.id}</td><td>${esc(r.date)}</td><td>${esc(r.name)}</td><td>${esc(r.feature)}</td>
+          <td class="actions"><button data-act="edit">Edit</button> <button class="danger" data-act="delete">Delete</button></td>
+        </tr>`;
+  }
+  if (!html) html = `<tr><td colspan="5" class="empty">${q ? "No rows match the filter." : "No rows yet — click “Add row”."}</td></tr>`;
+  $("#rows").innerHTML = html;
+
+  document.querySelectorAll("th[data-sort]").forEach(th => {
+    th.textContent = th.textContent.replace(/ [▲▼]$/, "") + (th.dataset.sort === sortKey ? (sortDir > 0 ? " ▲" : " ▼") : "");
+  });
+  const first = $("#rows input[name=name]"); if (first) first.focus();
+}
+
+function readEditor(tr) {
+  const v = n => tr.querySelector(`input[name=${n}]`).value;
+  return { date: v("date"), name: v("name"), feature: v("feature") };
+}
+
+async function save(tr) {
+  const id = tr.dataset.id;
+  try {
+    if (id) { await api("PUT", `/api/rows/${id}`, readEditor(tr)); editing = null; flash("Saved", true); }
+    else    { await api("POST", "/api/rows", readEditor(tr)); adding = false; flash("Row added", true); }
+    await load();
+  } catch (e) { flash(e.message); }
+}
+
+$("#rows").addEventListener("click", async e => {
+  const btn = e.target.closest("button"); if (!btn) return;
+  const tr = btn.closest("tr"), id = tr.dataset.id ? Number(tr.dataset.id) : null;
+  switch (btn.dataset.act) {
+    case "edit":   editing = id; adding = false; flash(""); render(); break;
+    case "cancel": editing = null; adding = false; flash(""); render(); break;
+    case "save":   save(tr); break;
+    case "delete":
+      if (!confirm(`Delete row ${id}?`)) return;
+      try { await api("DELETE", `/api/rows/${id}`); flash("Deleted", true); await load(); }
+      catch (err) { flash(err.message); }
+  }
+});
+
+$("#rows").addEventListener("keydown", e => {
+  const tr = e.target.closest("tr"); if (!tr || e.target.tagName !== "INPUT") return;
+  if (e.key === "Enter") save(tr);
+  if (e.key === "Escape") { editing = null; adding = false; render(); }
+});
+
+$("#addBtn").onclick = () => { adding = true; editing = null; flash(""); render(); };
+$("#filter").oninput = render;
+document.querySelectorAll("th[data-sort]").forEach(th => th.onclick = () => {
+  const k = th.dataset.sort; sortDir = (k === sortKey) ? -sortDir : 1; sortKey = k; render();
+});
+
+load();
+</script>
+</body>
+</html>

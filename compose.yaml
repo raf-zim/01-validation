@@ -1,0 +1,15 @@
+services:
+  featuretable:
+    build: .
+    image: featuretable:latest
+    container_name: featuretable
+    ports:
+      - "8080:8080"
+    volumes:
+      - featuretable-data:/data
+    # Start the container (and therefore the Go app) whenever Docker starts,
+    # and restart it if it crashes. Only `docker compose stop/down` keeps it off.
+    restart: unless-stopped
+
+volumes:
+  featuretable-data:

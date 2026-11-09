@@ -1,0 +1,7 @@
+# local build/run output
+*.log
+bin/
+data/
+*.db
+*.db-shm
+*.db-wal

@@ -1,0 +1,13 @@
+data/
+*.exe
+featuretable
+README.md
+start.ps1
+.git
+start.cmd
+start.log
+verify.ps1
+verify.log
+bin/
+build-exe.cmd
+build-exe.log
