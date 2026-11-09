@@ -16,7 +16,7 @@ function Step($name, [scriptblock]$cmd) {
     }
 }
 
-Step "Stop existing container (data volume is kept)" { docker compose down }
+Step "Stop existing container (db and logs folders are kept)" { docker compose down }
 Step "Build image (runs go vet + go test)"            { docker compose build --progress plain }
 Step "Start new container"                             { docker compose up -d }
 

@@ -95,4 +95,4 @@ The SQLite database is the file `.\db\featuretable.db` in the project folder, ma
 - `store.go`: SQLite access for the `features` table
 - `static/index.html`: the single-page UI
 - `Dockerfile`: multi-stage build to a distroless, non-root image
-- `compose.yaml`: port 8080, data volume, auto-restart
+- `compose.yaml`: port 8080, `.\db` and `.\logs` folders, time zone, auto-restart
