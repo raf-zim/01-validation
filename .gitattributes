@@ -1,0 +1,4 @@
+# Normalise line endings: LF in the repo, CRLF on checkout for Windows scripts.
+* text=auto
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
