@@ -39,6 +39,15 @@ func jpegBytes(t *testing.T) []byte {
 
 var webpBytes = append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 "), make([]byte, 24)...)
 
+// mp4Bytes is an ftyp box (size 24) followed by a few bytes of payload.
+func mp4Bytes(brand string) []byte {
+	b := []byte{0, 0, 0, 24}
+	b = append(b, "ftyp"+brand+"\x00\x00\x02\x00"+brand+"iso2"...)
+	return append(b, []byte("\x00\x00\x00\x08free")...)
+}
+
+var pdfBytes = []byte("%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n")
+
 func upload(t *testing.T, h http.Handler, id, field, name string, data []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
@@ -86,12 +95,18 @@ func TestContentTypeFor(t *testing.T) {
 		{"a.jpg", jpegBytes(t), "image/jpeg"},
 		{"a.jpeg", jpegBytes(t), "image/jpeg"},
 		{"a.webp", webpBytes, "image/webp"},
+		{"clip.mp4", mp4Bytes("isom"), "video/mp4"},
+		{"clip.MP4", mp4Bytes("mp42"), "video/mp4"},
+		{"doc.pdf", pdfBytes, "application/pdf"},
+		{"fake.mp4", []byte("<html>not a video at all</html>"), "application/octet-stream"},
+		{"fake.pdf", []byte("<html>not a pdf</html>"), "application/octet-stream"},
+		{"mp4-named.pdf", mp4Bytes("isom"), "application/octet-stream"},
 		{"notes.txt", []byte("hello\nworld"), "text/plain; charset=utf-8"},
 		{"fake.png", []byte("<html><script>alert(1)</script></html>"), "application/octet-stream"},
 		{"jpeg-named.png", jpegBytes(t), "application/octet-stream"},
 		{"binary.txt", []byte{0, 1, 2, 0xff}, "application/octet-stream"},
 		{"page.html", []byte("<html></html>"), "application/octet-stream"},
-		{"report.pdf", []byte("%PDF-1.4"), "application/octet-stream"},
+		{"report.docx", []byte("PK\x03\x04"), "application/octet-stream"},
 		{"noext", png, "application/octet-stream"},
 	}
 	for _, c := range cases {
@@ -212,7 +227,7 @@ func TestViewTextAndOtherTypes(t *testing.T) {
 		t.Errorf("txt view: %d %q %q", v.Code, v.Header().Get("Content-Type"), v.Body.String())
 	}
 
-	for _, n := range []string{"page.html", "fake.png", "report.pdf"} {
+	for _, n := range []string{"page.html", "fake.png", "fake.pdf", "fake.mp4"} {
 		body := []byte("<html><script>alert(1)</script></html>")
 		rec := upload(t, h, "1", "file", n, body)
 		var row Row
@@ -316,5 +331,65 @@ func TestUploadTooLarge(t *testing.T) {
 	// The earlier file must still be there.
 	if dl := get(h, "/api/rows/1/file"); dl.Body.Len() != 1<<10 {
 		t.Errorf("file after rejected upload: %d bytes", dl.Body.Len())
+	}
+}
+
+func TestViewVideoAndPDF(t *testing.T) {
+	h, _ := newRowHandler(t)
+	video := mp4Bytes("isom")
+
+	rec := upload(t, h, "1", "file", "clip.mp4", video)
+	var row Row
+	json.Unmarshal(rec.Body.Bytes(), &row)
+	if rec.Code != 200 || row.File.Type != "video/mp4" || !row.File.Viewable {
+		t.Fatalf("mp4 upload: %d %+v", rec.Code, row.File)
+	}
+	v := get(h, "/api/rows/1/file?view=1")
+	if v.Code != 200 || v.Header().Get("Content-Type") != "video/mp4" ||
+		!strings.HasPrefix(v.Header().Get("Content-Disposition"), "inline") {
+		t.Errorf("mp4 view: %d %q %q", v.Code, v.Header().Get("Content-Type"), v.Header().Get("Content-Disposition"))
+	}
+	if csp := v.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "media-src 'self'") || !strings.Contains(csp, "sandbox") {
+		t.Errorf("mp4 CSP = %q", csp)
+	}
+	// Range requests (used by the video player to seek) return 206.
+	req := httptest.NewRequest("GET", "/api/rows/1/file?view=1", nil)
+	req.Header.Set("Range", "bytes=4-7")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusPartialContent || rr.Body.String() != "ftyp" {
+		t.Errorf("range: %d %q", rr.Code, rr.Body.String())
+	}
+
+	rec = upload(t, h, "1", "file", "doc.pdf", pdfBytes)
+	json.Unmarshal(rec.Body.Bytes(), &row)
+	if rec.Code != 200 || row.File.Type != "application/pdf" || !row.File.Viewable {
+		t.Fatalf("pdf upload: %d %+v", rec.Code, row.File)
+	}
+	v = get(h, "/api/rows/1/file?view=1")
+	if v.Code != 200 || v.Header().Get("Content-Type") != "application/pdf" || !bytes.Equal(v.Body.Bytes(), pdfBytes) {
+		t.Errorf("pdf view: %d %q", v.Code, v.Header().Get("Content-Type"))
+	}
+	if csp := v.Header().Get("Content-Security-Policy"); csp != "" {
+		t.Errorf("pdf must not be sandboxed (breaks browser PDF viewers), CSP = %q", csp)
+	}
+	if v.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("pdf missing nosniff")
+	}
+}
+
+func TestCSPFor(t *testing.T) {
+	for ctype, want := range map[string]string{
+		"image/png":                 "img-src 'self'",
+		"text/plain; charset=utf-8": "sandbox",
+		"video/mp4":                 "media-src 'self'",
+		"application/octet-stream":  "default-src 'none'",
+	} {
+		if got := cspFor(ctype); !strings.Contains(got, want) || !strings.Contains(got, "sandbox") {
+			t.Errorf("cspFor(%q) = %q, want it to contain %q and sandbox", ctype, got, want)
+		}
+	}
+	if cspFor("application/pdf") != "" {
+		t.Error("pdf should get no CSP")
 	}
 }

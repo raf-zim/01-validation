@@ -40,6 +40,11 @@ $txtPath = Join-Path $tmpDir "verify.txt"
 [IO.File]::WriteAllText($txtPath, "hello from verify.ps1")
 $htmlPath = Join-Path $tmpDir "verify.html"
 [IO.File]::WriteAllText($htmlPath, "<html><script>alert(1)</script></html>")
+$pdfPath = Join-Path $tmpDir "verify.pdf"
+[IO.File]::WriteAllText($pdfPath, "%PDF-1.4`n1 0 obj << /Type /Catalog >> endobj`ntrailer << /Root 1 0 R >>`n%%EOF`n")
+$mp4Path = Join-Path $tmpDir "verify.mp4"
+# ftyp box (size 24, brand isom) + an empty free box: enough to be recognised as MP4
+[IO.File]::WriteAllBytes($mp4Path, [byte[]]([byte[]](0,0,0,24) + [Text.Encoding]::ASCII.GetBytes("ftypisom") + [byte[]](0,0,2,0) + [Text.Encoding]::ASCII.GetBytes("isomiso2") + [byte[]](0,0,0,8) + [Text.Encoding]::ASCII.GetBytes("free")))
 $script:fileRowId = $null
 
 function Status($r) { [int]$r.StatusCode }
@@ -131,10 +136,28 @@ Check "file: txt viewable, html never served inline" {
     Assert ((Status $v) -eq 415) "html view status $(Status $v), want 415"
     $d = Req GET "/api/rows/$id/file"
     Assert ((Hdr $d "Content-Type") -eq "application/octet-stream") "html download type $(Hdr $d 'Content-Type')"
-    # leave the png attached for the restart check below
+    "txt text/plain inline; html 415 + octet-stream"
+}
+Check "file: mp4 and pdf viewable inline" {
+    $id = $script:fileRowId
+    $m = Upload $id $mp4Path "verify.mp4"
+    $mf = ($m.Body | ConvertFrom-Json).file
+    Assert ($m.Status -eq 200 -and $mf.type -eq "video/mp4" -and $mf.viewable -eq $true) "mp4 upload $($m.Status) $($m.Body)"
+    $v = Req GET "/api/rows/$id/file?view=1"
+    Assert ((Hdr $v "Content-Type") -eq "video/mp4" -and (Hdr $v "Content-Disposition") -like "inline*") "mp4 view $(Hdr $v 'Content-Type') $(Hdr $v 'Content-Disposition')"
+    Assert ((Hdr $v "Content-Security-Policy") -match "media-src 'self'") "mp4 CSP $(Hdr $v 'Content-Security-Policy')"
+    $range = curl.exe -s -o NUL -w "%{http_code}" -H "Range: bytes=0-3" "$base/api/rows/$id/file?view=1"
+    Assert ($range -eq "206") "mp4 range request $range, want 206"
+    $p = Upload $id $pdfPath "verify.pdf"
+    $pf = ($p.Body | ConvertFrom-Json).file
+    Assert ($p.Status -eq 200 -and $pf.type -eq "application/pdf" -and $pf.viewable -eq $true) "pdf upload $($p.Status) $($p.Body)"
+    $v = Req GET "/api/rows/$id/file?view=1"
+    Assert ((Hdr $v "Content-Type") -eq "application/pdf" -and (Hdr $v "Content-Disposition") -like "inline*") "pdf view $(Hdr $v 'Content-Type')"
+    Assert (-not (Hdr $v "Content-Security-Policy")) "pdf should have no CSP, got $(Hdr $v 'Content-Security-Policy')"
+    Assert ((Hdr $v "X-Content-Type-Options") -eq "nosniff") "pdf missing nosniff"
     $u = Upload $id $pngPath "verify.png"
     Assert ($u.Status -eq 200) "re-upload png $($u.Status)"
-    "txt text/plain inline; html 415 + octet-stream"
+    "mp4 video/mp4 inline + range 206; pdf application/pdf inline"
 }
 Check "validation rejects bad date" {
     $r = Req POST "/api/rows" '{"date":"nope","name":"x","feature":"y"}'

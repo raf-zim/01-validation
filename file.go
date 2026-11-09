@@ -29,7 +29,12 @@ var viewableTypes = map[string]string{
 	".jpg":  "image/jpeg",
 	".jpeg": "image/jpeg",
 	".webp": "image/webp",
+	".mp4":  "video/mp4",
+	".pdf":  "application/pdf",
 }
+
+// viewableList is the human-readable list used in error messages.
+const viewableList = "txt, webp, jpg, jpeg, png, mp4 and pdf"
 
 func isViewable(ctype string) bool {
 	for _, t := range viewableTypes {
@@ -54,10 +59,44 @@ func contentTypeFor(name string, data []byte) string {
 		}
 		return "application/octet-stream"
 	}
+	if want == "video/mp4" {
+		if isMP4(data) {
+			return want
+		}
+		return "application/octet-stream"
+	}
 	if http.DetectContentType(data) == want {
 		return want
 	}
 	return "application/octet-stream"
+}
+
+// isMP4 checks for an ISO base media file: the first box is "ftyp" with a
+// sane size. (http.DetectContentType only recognises some "mp4*" brands and
+// misses common ones such as isom/dash-only files.)
+func isMP4(data []byte) bool {
+	if len(data) < 16 || string(data[4:8]) != "ftyp" {
+		return false
+	}
+	size := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	return size >= 16 && size <= len(data) && size%4 == 0
+}
+
+// cspFor is the Content-Security-Policy sent with a file response. Images,
+// text and video run in a sandbox with nothing but their own content
+// allowed. PDFs get no CSP: browsers' built-in PDF viewers refuse to run
+// inside a sandboxed document. That is safe because a file is only ever
+// served as application/pdf after its bytes were checked to be a PDF, and
+// nosniff stops the browser treating it as anything else.
+func cspFor(ctype string) string {
+	switch {
+	case ctype == "application/pdf":
+		return ""
+	case strings.HasPrefix(ctype, "video/"):
+		return "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox"
+	default:
+		return "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"
+	}
 }
 
 // cleanFileName keeps only the base name, drops control characters and
@@ -135,7 +174,7 @@ func registerFileRoutes(mux *http.ServeMux, store *Store, logger *log.Logger) {
 		view := r.URL.Query().Get("view") == "1"
 		if view && !info.Viewable {
 			writeJSON(w, http.StatusUnsupportedMediaType,
-				map[string]string{"error": "only txt, webp, jpg, jpeg and png files can be viewed"})
+				map[string]string{"error": "only " + viewableList + " files can be viewed"})
 			return
 		}
 		disposition := "attachment"
@@ -146,9 +185,10 @@ func registerFileRoutes(mux *http.ServeMux, store *Store, logger *log.Logger) {
 		h.Set("Content-Type", info.Type)
 		h.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": info.Name}))
 		h.Set("X-Content-Type-Options", "nosniff")
-		// Uploaded content never runs as a page: no scripts, no plugins,
-		// only its own image and inline styles (for the text view).
-		h.Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+		// Uploaded content never runs as a page (see cspFor).
+		if csp := cspFor(info.Type); csp != "" {
+			h.Set("Content-Security-Policy", csp)
+		}
 		h.Set("Cache-Control", "private, no-cache")
 		extendDeadlines(w)
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))

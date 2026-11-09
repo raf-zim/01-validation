@@ -41,15 +41,15 @@ curl.exe http://localhost:8080/api/rows     # the table as JSON
 | DELETE | `/api/rows/{id}` | –                                                 |
 | PUT    | `/api/rows/{id}/file` | `multipart/form-data` with a `file` field: attach or replace (max `MAX_UPLOAD_MB`) |
 | GET    | `/api/rows/{id}/file` | – download (always `attachment`) |
-| GET    | `/api/rows/{id}/file?view=1` | – show inline; only txt, webp, jpg, jpeg and png, otherwise 415 |
+| GET    | `/api/rows/{id}/file?view=1` | – show inline; only txt, webp, jpg, jpeg, png, mp4 and pdf, otherwise 415 |
 | DELETE | `/api/rows/{id}/file` | – remove the file |
 | GET    | `/healthz`       | – 204 when healthy, 503 during shutdown or if the DB is unreachable |
 
 ## File attachments
 
 - **Storage**: the bytes go in the `file` BLOB column of `features`, alongside `file_name`, `file_type` and `file_size`. The columns were added to the existing table on first start, and existing rows kept all their data. `GET /api/rows` returns only the file's name, type, size and whether it can be viewed, never the bytes.
-- **On the page**: the **File** column has Upload, Replace and ✕ (remove), and the file name downloads it. For txt, webp, jpg, jpeg and png there is also a **View** button. It opens the file in a frame on the page, and **Open in window** in that frame opens a separate popup window.
-- **Safety**: a file only counts as viewable if its extension is one of those five *and* its content matches. A `.png` that is really HTML is treated as a download. Everything else is served as `application/octet-stream` with `Content-Disposition: attachment`. Every file response sends `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`, so uploaded content can never run as a web page. File names are reduced to a safe base name.
+- **On the page**: the **File** column has Upload, Replace and ✕ (remove), and the file name downloads it. For txt, webp, jpg, jpeg, png, mp4 and pdf there is also a **View** button. It opens the file in a frame on the page: images are scaled to fit, videos play in the browser's player and PDFs open in the browser's PDF viewer, and **Open in window** in that frame opens a separate popup window.
+- **Safety**: a file only counts as viewable if its extension is one of those seven *and* its content matches. A `.png` that is really HTML is treated as a download. Everything else is served as `application/octet-stream` with `Content-Disposition: attachment`. Every file response sends `X-Content-Type-Options: nosniff`, and all except PDFs send a sandboxing `Content-Security-Policy`, so uploaded content can never run as a web page. PDFs are the exception because browsers' built-in PDF viewers won't run inside a sandbox; a file is only served as a PDF once its contents are confirmed to be one. Videos support range requests, so seeking works. File names are reduced to a safe base name.
 - **Limits**: `MAX_UPLOAD_MB` (default 10). Uploads stream straight into memory without temp files. An upload or download gets up to 2 minutes, while the server's short timeouts still apply to every other request.
 
 ## Logging, tracing, health check, shutdown

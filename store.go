@@ -27,7 +27,7 @@ type FileInfo struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"` // content type the server will serve it as
 	Size     int64  `json:"size"`
-	Viewable bool   `json:"viewable"` // txt/webp/jpg/jpeg/png: can be shown inline
+	Viewable bool   `json:"viewable"` // txt/webp/jpg/jpeg/png/mp4/pdf: can be shown inline
 }
 
 var (
