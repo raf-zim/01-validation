@@ -22,7 +22,7 @@ start http://localhost:8080
 Without compose:
 ```powershell
 docker build -t featuretable .
-docker run -d --name featuretable -p 8080:8080 -v featuretable-data:/data --restart unless-stopped featuretable
+docker run -d --name featuretable -p 8080:8080 -v ${PWD}/db:/db -v ${PWD}/logs:/logs -e TZ=Asia/Jerusalem --restart unless-stopped featuretable
 ```
 
 Check it from outside the container:
@@ -78,14 +78,14 @@ logs\http-2026-11-10.log
 | Env var   | Default (in container)   |
 |-----------|--------------------------|
 | `PORT`    | `8080`                   |
-| `DB_PATH` | `/data/featuretable.db`  |
+| `DB_PATH` | `/db/featuretable.db`    |
+| `DB_JOURNAL_MODE` | `DELETE` (`WAL` or `TRUNCATE` also accepted; the app's default outside Docker is `WAL`) |
 | `SHUTDOWN_TIMEOUT` | `30s`           |
 | `LOG_DIR` | `/logs` (unset = stdout only) |
 | `LOG_RETENTION_DAYS` | `4`           |
 | `TZ` | `Asia/Jerusalem` (set in compose; decides when midnight is) |
 
-Data is kept in the `featuretable-data` volume, so it survives container rebuilds.
-`docker compose down -v` deletes it.
+The SQLite database is the file `.\db\featuretable.db` in the project folder, mapped into the container at `/db`. It survives container restarts, rebuilds and `docker compose down -v`. To back it up, stop the container (`docker compose stop`) and copy the file. Because the folder is mapped from Windows, SQLite runs with `DB_JOURNAL_MODE=DELETE`: WAL mode depends on shared memory, which isn't reliable on a Windows folder mapped into a Linux container.
 
 ## Files
 

@@ -66,6 +66,21 @@ Check "CRUD insert / update / delete" {
     Assert ((Status $d) -eq 204) "delete status $(Status $d)"
     "row $id created, edited, deleted"
 }
+Check "database file on host is the live database" {
+    $db = Join-Path $PSScriptRoot "db\featuretable.db"
+    Assert (Test-Path $db) "missing $db"
+    $t0 = (Get-Item $db).LastWriteTimeUtc
+    Start-Sleep -Milliseconds 1100
+    $c = Req POST "/api/rows" '{"date":"2026-11-09","name":"verify","feature":"db file check"}'
+    $id = ($c.Content | ConvertFrom-Json).id
+    $t1 = (Get-Item $db).LastWriteTimeUtc
+    Req DELETE "/api/rows/$id" | Out-Null
+    Assert ($t1 -gt $t0) "db\featuretable.db not modified by an insert"
+    Assert (-not (Test-Path "$db-wal")) "unexpected -wal file (journal mode should be DELETE)"
+    $logs = docker logs featuretable | Out-String
+    Assert ($logs -match "sqlite database /db/featuretable.db \(journal mode DELETE\)") "journal mode DELETE not logged"
+    "db\featuretable.db, journal mode DELETE"
+}
 Check "validation rejects bad date" {
     $r = Req POST "/api/rows" '{"date":"nope","name":"x","feature":"y"}'
     Assert ((Status $r) -eq 400) "status $(Status $r)"

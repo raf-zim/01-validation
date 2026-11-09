@@ -13,3 +13,4 @@ build-exe.cmd
 build-exe.log
 deploy.ps1
 logs/
+db/

@@ -9,8 +9,12 @@ services:
       # Logs rotate at midnight in this time zone.
       TZ: Asia/Jerusalem
       LOG_RETENTION_DAYS: "4"
+      # WAL needs shared memory, which is unreliable on a Windows folder
+      # mounted into the container; DELETE (rollback journal) is safe there.
+      DB_JOURNAL_MODE: DELETE
     volumes:
-      - featuretable-data:/data
+      # SQLite database file appears in .\db on the host.
+      - ./db:/db
       # Daily log files (http-YYYY-MM-DD.log) appear in .\logs on the host.
       - ./logs:/logs
     # Start the container (and therefore the Go app) whenever Docker starts,
@@ -19,6 +23,3 @@ services:
     # Give the app's graceful shutdown (SHUTDOWN_TIMEOUT=30s) time to finish
     # before Docker sends SIGKILL (Docker's default is only 10s).
     stop_grace_period: 35s
-
-volumes:
-  featuretable-data:

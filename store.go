@@ -33,11 +33,21 @@ CREATE TABLE IF NOT EXISTS features (
 // Store wraps the SQLite database holding the "features" table.
 type Store struct{ db *sql.DB }
 
-func OpenStore(path string) (*Store, error) {
+// JournalModes are the SQLite journal modes OpenStore accepts.
+//   - WAL: fastest, but needs shared memory (mmap), which is unreliable on
+//     host folders bind-mounted into Docker Desktop on Windows/macOS.
+//   - DELETE: SQLite's classic rollback journal; safe on any filesystem.
+var JournalModes = map[string]bool{"WAL": true, "DELETE": true, "TRUNCATE": true}
+
+func OpenStore(path, journalMode string) (*Store, error) {
+	journalMode = strings.ToUpper(strings.TrimSpace(journalMode))
+	if !JournalModes[journalMode] {
+		return nil, fmt.Errorf("unsupported journal mode %q (use WAL, DELETE or TRUNCATE)", journalMode)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	dsn := "file:" + path + "?_pragma=journal_mode(" + journalMode + ")&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -53,6 +63,13 @@ func OpenStore(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) Ping() error { return s.db.Ping() }
+
+// JournalMode reports the journal mode SQLite is actually using.
+func (s *Store) JournalMode() (string, error) {
+	var mode string
+	err := s.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode)
+	return strings.ToUpper(mode), err
+}
 
 func (s *Store) List() ([]Row, error) {
 	rs, err := s.db.Query(`SELECT id, date, name, feature FROM features ORDER BY id`)

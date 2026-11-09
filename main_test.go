@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -20,7 +21,7 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"), "WAL")
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -319,5 +320,52 @@ func TestCRUD(t *testing.T) {
 	}
 	if rec := do(t, h, "DELETE", "/api/rows/1", ""); rec.Code != 404 {
 		t.Errorf("delete again: %d", rec.Code)
+	}
+}
+
+// ---- journal mode ----
+
+func TestJournalModes(t *testing.T) {
+	for _, mode := range []string{"WAL", "DELETE", "truncate"} {
+		path := filepath.Join(t.TempDir(), "j.db")
+		s, err := OpenStore(path, mode)
+		if err != nil {
+			t.Fatalf("%s: %v", mode, err)
+		}
+		if got, err := s.JournalMode(); err != nil || got != strings.ToUpper(mode) {
+			t.Errorf("mode %s: got %q err %v", mode, got, err)
+		}
+		if _, err := s.Insert(Row{Date: "2026-11-09", Name: "a", Feature: "b"}); err != nil {
+			t.Errorf("%s insert: %v", mode, err)
+		}
+		s.Close()
+	}
+	if _, err := OpenStore(filepath.Join(t.TempDir(), "x.db"), "MEMORY"); err == nil {
+		t.Error("unsupported journal mode accepted")
+	}
+}
+
+// A database created in WAL mode (the old Docker volume) must open in
+// DELETE mode with all its rows: this is the migration path to ./db.
+func TestWALDatabaseReopensInDeleteMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "migrate.db")
+	s, _ := OpenStore(path, "WAL")
+	for i := 0; i < 3; i++ {
+		s.Insert(Row{Date: "2026-11-09", Name: fmt.Sprintf("n%d", i), Feature: "f"})
+	}
+	s.Close()
+
+	s2, err := OpenStore(path, "DELETE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	rows, _ := s2.List()
+	mode, _ := s2.JournalMode()
+	if len(rows) != 3 || mode != "DELETE" {
+		t.Errorf("after reopen: %d rows, mode %s", len(rows), mode)
+	}
+	if _, err := os.Stat(path + "-wal"); err == nil {
+		t.Error("leftover -wal file after switching to DELETE mode")
 	}
 }

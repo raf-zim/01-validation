@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -78,10 +79,17 @@ func main() {
 		logger.Fatalf("invalid SHUTDOWN_TIMEOUT: %v", err)
 	}
 
-	dbPath := env("DB_PATH", "data/featuretable.db")
-	store, err := OpenStore(dbPath)
+	dbPath := env("DB_PATH", "db/featuretable.db")
+	store, err := OpenStore(dbPath, env("DB_JOURNAL_MODE", "WAL"))
 	if err != nil {
+		if strings.Contains(err.Error(), "disk I/O error") {
+			logger.Printf("hint: a database file created in WAL mode cannot be opened on a host-mounted folder; " +
+				"convert it once with `sqlite3 file.db 'PRAGMA journal_mode=DELETE'` on a local disk, then copy it back")
+		}
 		logger.Fatalf("open sqlite db %s: %v", dbPath, err)
+	}
+	if mode, err := store.JournalMode(); err == nil {
+		logger.Printf("sqlite database %s (journal mode %s)", dbPath, mode)
 	}
 
 	ln, err := net.Listen("tcp", ":"+port)
