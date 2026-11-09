@@ -52,6 +52,21 @@ These follow the patterns in [kelche.co: Building an HTTP server in Go](https://
 - **Health check**: an atomic `healthy` flag is set to 1 once the server starts and to 0 as soon as shutdown begins. `/healthz` returns 204 or 503. The Docker `HEALTHCHECK` runs the binary with `-healthcheck`, because the distroless image has no curl.
 - **Graceful shutdown**: on SIGINT or SIGTERM (`docker stop`), the app marks itself unhealthy, disables keep-alives, and calls `server.Shutdown` with a 30s deadline. That lets in-flight requests finish before the database closes. Server timeouts: read 5s, read-header 5s, write 10s, idle 15s. Compose sets `stop_grace_period: 35s`, so Docker doesn't kill the app partway through.
 
+## Log files and rotation
+
+Besides stdout (`docker logs`), the server writes its log to a file per day, which appears in `.\logs` on the host (bind-mounted at `/logs`):
+
+```
+logs\http-2026-11-09.log
+logs\http-2026-11-10.log
+...
+```
+
+- **Rotation**: the first log line after midnight opens the new day's file. Midnight is in the container's `TZ`, which compose sets to `Asia/Jerusalem`. Docker's health check logs a request every 30 seconds, so the switch happens within a minute of midnight.
+- **Retention**: when the server starts and at every rotation, it deletes `http-YYYY-MM-DD.log` files dated more than `LOG_RETENTION_DAYS` days ago (default 4). On the 9th, the files for the 5th through the 9th are kept and the 4th and earlier are deleted. Other files in the folder are never touched.
+- Each rotation writes a `logrotate:` line at the top of the new file, naming any files it deleted.
+- If `LOG_DIR` is unset, the server logs to stdout only.
+
 ## Tests
 
 `main_test.go` covers the tracing, logging, health, probe, timeout and graceful-shutdown behaviour, plus CRUD through the full handler stack against a temporary SQLite database. The Docker build runs `go vet` and `go test`, so the image is not built if a test fails.
@@ -65,6 +80,9 @@ These follow the patterns in [kelche.co: Building an HTTP server in Go](https://
 | `PORT`    | `8080`                   |
 | `DB_PATH` | `/data/featuretable.db`  |
 | `SHUTDOWN_TIMEOUT` | `30s`           |
+| `LOG_DIR` | `/logs` (unset = stdout only) |
+| `LOG_RETENTION_DAYS` | `4`           |
+| `TZ` | `Asia/Jerusalem` (set in compose; decides when midnight is) |
 
 Data is kept in the `featuretable-data` volume, so it survives container rebuilds.
 `docker compose down -v` deletes it.
@@ -72,7 +90,8 @@ Data is kept in the `featuretable-data` volume, so it survives container rebuild
 ## Files
 
 - `main.go`: HTTP server, routes, middleware (tracing, logging), health check, graceful shutdown, `-healthcheck` flag
-- `main_test.go`: unit and integration tests (run during the Docker build)
+- `rotate.go`: daily log file writer with retention purge
+- `main_test.go`, `rotate_test.go`: unit and integration tests (run during the Docker build)
 - `store.go`: SQLite access for the `features` table
 - `static/index.html`: the single-page UI
 - `Dockerfile`: multi-stage build to a distroless, non-root image

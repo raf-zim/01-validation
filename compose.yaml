@@ -5,8 +5,14 @@ services:
     container_name: featuretable
     ports:
       - "8080:8080"
+    environment:
+      # Logs rotate at midnight in this time zone.
+      TZ: Asia/Jerusalem
+      LOG_RETENTION_DAYS: "4"
     volumes:
       - featuretable-data:/data
+      # Daily log files (http-YYYY-MM-DD.log) appear in .\logs on the host.
+      - ./logs:/logs
     # Start the container (and therefore the Go app) whenever Docker starts,
     # and restart it if it crashes. Only `docker compose stop/down` keeps it off.
     restart: unless-stopped

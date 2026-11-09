@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	_ "time/tzdata" // zone database baked in: the distroless image has none, and TZ decides when logs rotate
 )
 
 //go:embed static
@@ -50,7 +52,26 @@ func main() {
 		os.Exit(probe("http://127.0.0.1:" + port + "/healthz"))
 	}
 
-	logger := log.New(os.Stdout, "http: ", log.LstdFlags)
+	// Log to stdout (docker logs) and, if LOG_DIR is set, to a daily file
+	// <LOG_DIR>/http-YYYY-MM-DD.log, keeping LOG_RETENTION_DAYS days.
+	var logOut io.Writer = os.Stdout
+	var logFile *DailyFile
+	if dir := os.Getenv("LOG_DIR"); dir != "" {
+		keep, err := strconv.Atoi(env("LOG_RETENTION_DAYS", "4"))
+		if err != nil {
+			log.Fatalf("invalid LOG_RETENTION_DAYS: %v", err)
+		}
+		logFile, err = OpenDailyFile(dir, "http", keep, time.Now)
+		if err != nil {
+			log.Fatalf("open log dir %s: %v", dir, err)
+		}
+		logOut = io.MultiWriter(os.Stdout, logFile)
+	}
+	logger := log.New(logOut, "http: ", log.LstdFlags)
+	if logFile != nil {
+		logger.Printf("logging to %s (daily rotation, %s days kept, tz %s)",
+			logFile.Path(), env("LOG_RETENTION_DAYS", "4"), time.Now().Location())
+	}
 
 	shutdownTimeout, err := time.ParseDuration(env("SHUTDOWN_TIMEOUT", "30s"))
 	if err != nil {
@@ -83,6 +104,9 @@ func main() {
 		logger.Printf("closing database: %v", err)
 	}
 	logger.Println("server stopped")
+	if logFile != nil {
+		logFile.Close()
+	}
 }
 
 // newServer builds the http.Server with the timeouts from the article,
