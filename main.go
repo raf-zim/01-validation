@@ -2,16 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -19,8 +23,17 @@ import (
 //go:embed static
 var staticFiles embed.FS
 
-func env(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+// Context key for the request ID (unexported type so no other package can collide).
+type key int
+
+const requestIDKey key = 0
+
+// healthy is 1 while the server accepts traffic and 0 once shutdown has begun,
+// so /healthz starts failing before connections are drained.
+var healthy int32
+
+func env(k, def string) string {
+	if v := os.Getenv(k); v != "" {
 		return v
 	}
 	return def
@@ -34,62 +47,206 @@ func main() {
 
 	// Used by the Docker HEALTHCHECK: the runtime image has no shell or curl.
 	if *healthcheck {
-		c := http.Client{Timeout: 3 * time.Second}
-		resp, err := c.Get("http://127.0.0.1:" + port + "/healthz")
-		if err != nil || resp.StatusCode != http.StatusOK {
-			os.Exit(1)
-		}
-		os.Exit(0)
+		os.Exit(probe("http://127.0.0.1:" + port + "/healthz"))
+	}
+
+	logger := log.New(os.Stdout, "http: ", log.LstdFlags)
+
+	shutdownTimeout, err := time.ParseDuration(env("SHUTDOWN_TIMEOUT", "30s"))
+	if err != nil {
+		logger.Fatalf("invalid SHUTDOWN_TIMEOUT: %v", err)
 	}
 
 	dbPath := env("DB_PATH", "data/featuretable.db")
 	store, err := OpenStore(dbPath)
 	if err != nil {
-		log.Fatalf("open sqlite db: %v", err)
-	}
-	defer store.Close()
-
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           logRequests(newMux(store)),
-		ReadHeaderTimeout: 5 * time.Second,
+		logger.Fatalf("open sqlite db %s: %v", dbPath, err)
 	}
 
-	go func() {
-		log.Printf("serving on http://0.0.0.0:%s  (sqlite: %s)", port, dbPath)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
-		}
-	}()
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		logger.Fatalf("listen on :%s: %v", port, err)
+	}
 
-	// Graceful shutdown on `docker stop` (SIGTERM) or Ctrl+C.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	log.Print("shutting down")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
+	server := newServer(newHandler(store, logger, newRequestID), logger)
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	logger.Printf("server is ready to handle requests at %s (sqlite: %s, shutdown timeout: %s)",
+		ln.Addr(), dbPath, shutdownTimeout)
+
+	if err := serve(server, ln, quit, logger, shutdownTimeout); err != nil {
+		logger.Fatalf("server error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		logger.Printf("closing database: %v", err)
+	}
+	logger.Println("server stopped")
 }
 
-func newMux(store *Store) *http.ServeMux {
+// newServer builds the http.Server with the timeouts from the article,
+// plus ReadHeaderTimeout to bound slow-header (Slowloris) clients.
+func newServer(h http.Handler, logger *log.Logger) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ErrorLog:          logger,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       15 * time.Second,
+	}
+}
+
+// serve runs the server until a signal arrives on quit, then shuts down
+// gracefully: mark unhealthy, stop keep-alives, and let in-flight requests
+// finish within timeout. It returns nil on a clean shutdown.
+func serve(server *http.Server, ln net.Listener, quit <-chan os.Signal, logger *log.Logger, timeout time.Duration) error {
+	done := make(chan error, 1)
+
+	go func() {
+		sig := <-quit
+		logger.Printf("received %v, server is shutting down...", sig)
+		atomic.StoreInt32(&healthy, 0)
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		server.SetKeepAlivesEnabled(false)
+		if err := server.Shutdown(ctx); err != nil {
+			logger.Printf("could not gracefully shut down the server: %v", err)
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	atomic.StoreInt32(&healthy, 1)
+	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return <-done
+}
+
+// newHandler wires middleware around the routes: tracing runs first so the
+// logging middleware can include the request ID.
+func newHandler(store *Store, logger *log.Logger, nextRequestID func() string) http.Handler {
+	return tracing(nextRequestID)(logging(logger)(newMux(store, logger)))
+}
+
+// newRequestID returns a random 16-hex-char ID. The article uses
+// time.Now().UnixNano(), which can collide under concurrent requests.
+func newRequestID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return hex.EncodeToString(b)
+}
+
+// tracing propagates X-Request-Id: it keeps a caller-supplied ID (if it is
+// safe to log), otherwise generates one, stores it in the request context
+// and echoes it on the response.
+func tracing(nextRequestID func() string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestID := r.Header.Get("X-Request-Id")
+			if !validRequestID(requestID) {
+				requestID = nextRequestID()
+			}
+			ctx := context.WithValue(r.Context(), requestIDKey, requestID)
+			w.Header().Set("X-Request-Id", requestID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// validRequestID accepts 1-128 chars of [A-Za-z0-9._-] so a client cannot
+// inject newlines or junk into the logs.
+func validRequestID(id string) bool {
+	if len(id) == 0 || len(id) > 128 {
+		return false
+	}
+	for _, c := range id {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_', c == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func requestIDFrom(ctx context.Context) string {
+	if id, ok := ctx.Value(requestIDKey).(string); ok {
+		return id
+	}
+	return "unknown"
+}
+
+// statusRecorder captures the status code and size for the access log.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	n, err := s.ResponseWriter.Write(b)
+	s.bytes += n
+	return n, err
+}
+
+// logging writes one access-log line per request after the handler returns.
+// Same fields as the article, plus status, size and duration.
+func logging(logger *log.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			rec := &statusRecorder{ResponseWriter: w}
+			defer func() {
+				status := rec.status
+				if status == 0 {
+					status = http.StatusOK
+				}
+				logger.Printf("id=%s %s %s status=%d bytes=%d dur=%s remote=%s ua=%q",
+					requestIDFrom(r.Context()), r.Method, r.URL.Path, status, rec.bytes,
+					time.Since(start).Round(time.Microsecond), r.RemoteAddr, r.UserAgent())
+			}()
+			next.ServeHTTP(rec, r)
+		})
+	}
+}
+
+func newMux(store *Store, logger *log.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	sub, _ := fs.Sub(staticFiles, "static")
 	mux.Handle("GET /", http.FileServerFS(sub))
 
+	// 204 while healthy, 503 once shutdown has started or the DB is unreachable.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := store.Ping(); err != nil {
-			http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+		if atomic.LoadInt32(&healthy) == 1 && store.Ping() == nil {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		w.Write([]byte("ok"))
+		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 
 	mux.HandleFunc("GET /api/rows", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := store.List()
 		if err != nil {
-			writeErr(w, err)
+			writeErr(w, r, logger, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, rows)
@@ -102,7 +259,7 @@ func newMux(store *Store) *http.ServeMux {
 		}
 		out, err := store.Insert(in)
 		if err != nil {
-			writeErr(w, err)
+			writeErr(w, r, logger, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, out)
@@ -119,7 +276,7 @@ func newMux(store *Store) *http.ServeMux {
 		}
 		out, err := store.Update(id, in)
 		if err != nil {
-			writeErr(w, err)
+			writeErr(w, r, logger, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -131,13 +288,27 @@ func newMux(store *Store) *http.ServeMux {
 			return
 		}
 		if err := store.Delete(id); err != nil {
-			writeErr(w, err)
+			writeErr(w, r, logger, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 
 	return mux
+}
+
+// probe is the -healthcheck mode: exit 0 only on 204 from /healthz.
+func probe(url string) int {
+	c := http.Client{Timeout: 3 * time.Second}
+	resp, err := c.Get(url)
+	if err != nil {
+		return 1
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return 1
+	}
+	return 0
 }
 
 func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -158,7 +329,7 @@ func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
-func writeErr(w http.ResponseWriter, err error) {
+func writeErr(w http.ResponseWriter, r *http.Request, logger *log.Logger, err error) {
 	var ve ValidationError
 	switch {
 	case errors.As(err, &ve):
@@ -166,7 +337,7 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 	default:
-		log.Printf("error: %v", err)
+		logger.Printf("id=%s error: %v", requestIDFrom(r.Context()), err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 }
@@ -175,14 +346,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func logRequests(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		if r.URL.Path != "/healthz" {
-			log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Microsecond))
-		}
-	})
 }

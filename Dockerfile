@@ -8,9 +8,12 @@ COPY *.go ./
 COPY static ./static
 # go mod tidy resolves the SQLite driver (modernc.org/sqlite, pure Go, no CGO)
 # and writes go.sum inside the build, so no host Go toolchain is needed.
+# go vet + go test run here: a failing test fails the image build.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go mod tidy \
+ && go vet ./... \
+ && go test -count=1 ./... \
  && CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/server . \
  && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/featuretable.exe . \
  && cp go.mod go.sum /out/ \
@@ -30,12 +33,16 @@ COPY --from=build /out/server /app/server
 COPY --from=build --chown=nonroot:nonroot /out/data /data
 
 ENV PORT=8080 \
-    DB_PATH=/data/featuretable.db
+    DB_PATH=/data/featuretable.db \
+    SHUTDOWN_TIMEOUT=30s
 EXPOSE 8080
 VOLUME ["/data"]
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --start-interval=2s --retries=3 \
   CMD ["/app/server", "-healthcheck"]
+
+# docker stop sends SIGTERM; the app drains in-flight requests before exiting.
+STOPSIGNAL SIGTERM
 
 # The Go app starts automatically whenever the container starts.
 ENTRYPOINT ["/app/server"]

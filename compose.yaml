@@ -10,6 +10,9 @@ services:
     # Start the container (and therefore the Go app) whenever Docker starts,
     # and restart it if it crashes. Only `docker compose stop/down` keeps it off.
     restart: unless-stopped
+    # Give the app's graceful shutdown (SHUTDOWN_TIMEOUT=30s) time to finish
+    # before Docker sends SIGKILL (Docker's default is only 10s).
+    stop_grace_period: 35s
 
 volumes:
   featuretable-data:

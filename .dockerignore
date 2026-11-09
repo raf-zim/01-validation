@@ -11,3 +11,4 @@ verify.log
 bin/
 build-exe.cmd
 build-exe.log
+deploy.ps1
