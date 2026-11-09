@@ -26,6 +26,22 @@ function Req($method, $path, $body, $headers) {
         if ($_.Exception.Response) { return $_.Exception.Response } else { throw }
     }
 }
+# multipart upload with curl.exe (Windows PowerShell 5.1 has no -Form); returns "status body"
+function Upload($id, $path, $name) {
+    $out = curl.exe -s -w "`n%{http_code}" -X PUT -F "file=@$path;filename=$name" "$base/api/rows/$id/file"
+    $lines = @($out)
+    return @{ Status = [int]$lines[-1]; Body = ($lines[0..($lines.Count - 2)] -join "`n") }
+}
+$tmpDir = Join-Path $env:TEMP "featuretable-verify"
+New-Item -ItemType Directory -Force $tmpDir | Out-Null
+$pngPath = Join-Path $tmpDir "verify.png"
+[IO.File]::WriteAllBytes($pngPath, [Convert]::FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="))
+$txtPath = Join-Path $tmpDir "verify.txt"
+[IO.File]::WriteAllText($txtPath, "hello from verify.ps1")
+$htmlPath = Join-Path $tmpDir "verify.html"
+[IO.File]::WriteAllText($htmlPath, "<html><script>alert(1)</script></html>")
+$script:fileRowId = $null
+
 function Status($r) { [int]$r.StatusCode }
 function Hdr($r, $n) { if ($r.Headers -is [System.Net.WebHeaderCollection]) { $r.Headers[$n] } else { "$($r.Headers[$n])" } }
 
@@ -81,6 +97,45 @@ Check "database file on host is the live database" {
     Assert ($logs -match "sqlite database /db/featuretable.db \(journal mode DELETE\)") "journal mode DELETE not logged"
     "db\featuretable.db, journal mode DELETE"
 }
+Check "file: upload png, view inline, download attachment" {
+    $c = Req POST "/api/rows" '{"date":"2026-11-09","name":"verify","feature":"file check"}'
+    $id = ($c.Content | ConvertFrom-Json).id
+    $script:fileRowId = $id
+    $u = Upload $id $pngPath "verify.png"
+    Assert ($u.Status -eq 200) "upload status $($u.Status) $($u.Body)"
+    $f = ($u.Body | ConvertFrom-Json).file
+    Assert ($f.type -eq "image/png" -and $f.viewable -eq $true -and $f.size -eq (Get-Item $pngPath).Length) "file info $($u.Body)"
+    $v = Req GET "/api/rows/$id/file?view=1"
+    Assert ((Status $v) -eq 200) "view status $(Status $v)"
+    Assert ((Hdr $v "Content-Type") -eq "image/png") "view type $(Hdr $v 'Content-Type')"
+    Assert ((Hdr $v "Content-Disposition") -like "inline*") "view disposition $(Hdr $v 'Content-Disposition')"
+    Assert ((Hdr $v "Content-Security-Policy") -match "sandbox") "no sandbox CSP"
+    Assert ((Hdr $v "X-Content-Type-Options") -eq "nosniff") "no nosniff"
+    $dlPath = Join-Path $tmpDir "download.bin"
+    $code = curl.exe -s -o $dlPath -w "%{http_code}" "$base/api/rows/$id/file"
+    Assert ($code -eq "200") "download status $code"
+    Assert ((Get-FileHash $dlPath).Hash -eq (Get-FileHash $pngPath).Hash) "downloaded bytes differ"
+    $d = Req GET "/api/rows/$id/file"
+    Assert ((Hdr $d "Content-Disposition") -like "attachment*verify.png*") "download disposition $(Hdr $d 'Content-Disposition')"
+    "row ${id}: png viewable, download identical"
+}
+Check "file: txt viewable, html never served inline" {
+    $id = $script:fileRowId
+    $t = Upload $id $txtPath "verify.txt"
+    Assert ($t.Status -eq 200) "txt upload $($t.Status)"
+    $v = Req GET "/api/rows/$id/file?view=1"
+    Assert ((Hdr $v "Content-Type") -eq "text/plain; charset=utf-8") "txt view type $(Hdr $v 'Content-Type')"
+    $h = Upload $id $htmlPath "verify.html"
+    Assert ($h.Status -eq 200 -and ($h.Body | ConvertFrom-Json).file.viewable -eq $false) "html upload $($h.Status) $($h.Body)"
+    $v = Req GET "/api/rows/$id/file?view=1"
+    Assert ((Status $v) -eq 415) "html view status $(Status $v), want 415"
+    $d = Req GET "/api/rows/$id/file"
+    Assert ((Hdr $d "Content-Type") -eq "application/octet-stream") "html download type $(Hdr $d 'Content-Type')"
+    # leave the png attached for the restart check below
+    $u = Upload $id $pngPath "verify.png"
+    Assert ($u.Status -eq 200) "re-upload png $($u.Status)"
+    "txt text/plain inline; html 415 + octet-stream"
+}
 Check "validation rejects bad date" {
     $r = Req POST "/api/rows" '{"date":"nope","name":"x","feature":"y"}'
     Assert ((Status $r) -eq 400) "status $(Status $r)"
@@ -128,6 +183,17 @@ Check "container back up and healthy after restart" {
     "healthy, page HTTP 200"
 }
 
+Check "file survives container restart" {
+    $id = $script:fileRowId
+    Assert ($id) "no file row from earlier check"
+    $dlPath = Join-Path $tmpDir "after-restart.bin"
+    $code = curl.exe -s -o $dlPath -w "%{http_code}" "$base/api/rows/$id/file"
+    Assert ($code -eq "200") "download after restart $code"
+    Assert ((Get-FileHash $dlPath).Hash -eq (Get-FileHash $pngPath).Hash) "bytes differ after restart"
+    $d = Req DELETE "/api/rows/$id"
+    Assert ((Status $d) -eq 204) "cleanup delete $(Status $d)"
+    "row $id file intact, row cleaned up"
+}
 Check "log purge on startup: >4 days removed, 4 days kept" {
     Assert (-not (Test-Path (Join-Path $logDir "http-$old5.log"))) "http-$old5.log was not purged"
     Assert (Test-Path (Join-Path $logDir "http-$old4.log")) "http-$old4.log was wrongly purged"

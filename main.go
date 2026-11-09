@@ -74,6 +74,12 @@ func main() {
 			logFile.Path(), env("LOG_RETENTION_DAYS", "4"), time.Now().Location())
 	}
 
+	if mb, err := strconv.Atoi(env("MAX_UPLOAD_MB", "10")); err != nil || mb < 1 {
+		logger.Fatalf("invalid MAX_UPLOAD_MB: %q", os.Getenv("MAX_UPLOAD_MB"))
+	} else {
+		maxUploadBytes = int64(mb) << 20
+	}
+
 	shutdownTimeout, err := time.ParseDuration(env("SHUTDOWN_TIMEOUT", "30s"))
 	if err != nil {
 		logger.Fatalf("invalid SHUTDOWN_TIMEOUT: %v", err)
@@ -230,6 +236,10 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the real connection (used to
+// extend deadlines for file uploads and downloads).
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 func (s *statusRecorder) Write(b []byte) (int, error) {
 	if s.status == 0 {
 		s.status = http.StatusOK
@@ -274,6 +284,8 @@ func newMux(store *Store, logger *log.Logger) *http.ServeMux {
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
+
+	registerFileRoutes(mux, store, logger)
 
 	mux.HandleFunc("GET /api/rows", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := store.List()
@@ -366,7 +378,7 @@ func writeErr(w http.ResponseWriter, r *http.Request, logger *log.Logger, err er
 	switch {
 	case errors.As(err, &ve):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": ve.Error()})
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, ErrNotFound), errors.Is(err, ErrNoFile):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 	default:
 		logger.Printf("id=%s error: %v", requestIDFrom(r.Context()), err)

@@ -8,7 +8,7 @@
   :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#6b7385; --line:#e3e6ec; --accent:#2f6fed; --danger:#d64545; }
   * { box-sizing: border-box; }
   body { margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); }
-  main { max-width: 980px; margin: 40px auto; padding: 0 20px; }
+  main { max-width: 1140px; margin: 40px auto; padding: 0 20px; }
   h1 { font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--muted); margin: 0 0 20px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
@@ -21,6 +21,23 @@
   tr:last-child td { border-bottom:none; }
   td.id { color:var(--muted); width:60px; font-variant-numeric: tabular-nums; }
   td.actions { width:150px; text-align:right; white-space:nowrap; }
+  td.file { white-space:nowrap; }
+  td.file a { color:var(--accent); text-decoration:none; max-width:220px; display:inline-block; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; }
+  td.file a:hover { text-decoration:underline; }
+  td.file .size { color:var(--muted); font-size:12px; margin:0 6px 0 4px; }
+  td.file .none { color:var(--muted); margin-right:6px; }
+  button.sm { padding:3px 8px; font-size:12px; }
+  button.link { border:none; background:none; color:var(--muted); padding:3px 5px; }
+  button.link:hover { color:var(--danger); background:none; }
+  /* file viewer */
+  #viewer { position:fixed; inset:0; background:rgba(20,24,33,.55); display:none; align-items:center; justify-content:center; z-index:10; }
+  #viewer.open { display:flex; }
+  #viewer .box { background:#fff; border-radius:10px; width:min(900px,92vw); height:min(700px,86vh); display:flex; flex-direction:column; overflow:hidden; box-shadow:0 10px 40px rgba(0,0,0,.25); }
+  #viewer header { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--line); }
+  #viewer header strong { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #viewer .content { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; background:#f3f4f6; }
+  #viewer iframe { width:100%; height:100%; border:0; background:#fff; }
+  #viewer img { max-width:100%; max-height:100%; object-fit:contain; }
   tr.new td { background:#f3f7ff; }
   input { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; width:100%; background:#fff; color:inherit; }
   input:focus { outline:2px solid #c9d8fb; border-color:var(--accent); }
@@ -37,7 +54,7 @@
 <body>
 <main>
   <h1>Feature Table</h1>
-  <p class="sub">View, add, edit and delete rows. Changes are saved straight to the server.</p>
+  <p class="sub">View, add, edit and delete rows, and attach a file to each row. Changes are saved straight to the server.</p>
 
   <div class="card">
     <div class="toolbar">
@@ -51,6 +68,7 @@
           <th data-sort="date">Date</th>
           <th data-sort="name">Name</th>
           <th data-sort="feature">Feature</th>
+          <th class="noclick">File</th>
           <th class="noclick"></th>
         </tr>
       </thead>
@@ -58,13 +76,28 @@
     </table>
   </div>
   <div id="msg"></div>
+  <input type="file" id="picker" hidden>
 </main>
+
+<div id="viewer" role="dialog" aria-modal="true" aria-label="File viewer">
+  <div class="box">
+    <header>
+      <strong id="vName"></strong>
+      <button class="sm" id="vWindow" title="Open in a separate popup window">Open in window</button>
+      <a id="vDownload"><button class="sm">Download</button></a>
+      <button class="sm" id="vClose">Close</button>
+    </header>
+    <div class="content" id="vContent"></div>
+  </div>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
-let rows = [], editing = null, adding = false, sortKey = "id", sortDir = 1;
+let rows = [], editing = null, adding = false, sortKey = "id", sortDir = 1, uploading = null, pickFor = null;
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function fmtSize(n) { return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB"; }
+const fileURL = (id, view) => `/api/rows/${id}/file` + (view ? "?view=1" : "");
 function today() { return new Date().toISOString().slice(0, 10); }
 function flash(text, ok) { const m = $("#msg"); m.textContent = text || ""; m.className = ok ? "ok" : ""; if (ok) setTimeout(() => { if (m.textContent === text) m.textContent = ""; }, 2000); }
 
@@ -86,7 +119,20 @@ function editorCells(r) {
     <td><input type="date" name="date" value="${esc(r.date)}"></td>
     <td><input name="name" value="${esc(r.name)}" placeholder="Name"></td>
     <td><input name="feature" value="${esc(r.feature)}" placeholder="Feature"></td>
+    <td class="file">${r.file ? esc(r.file.name) : ""}</td>
     <td class="actions"><button class="primary" data-act="save">Save</button> <button data-act="cancel">Cancel</button></td>`;
+}
+
+function fileCell(r) {
+  if (uploading === r.id) return `<td class="file"><span class="none">Uploading…</span></td>`;
+  if (!r.file) return `<td class="file"><span class="none">—</span><button class="sm" data-act="upload">Upload</button></td>`;
+  const f = r.file;
+  return `<td class="file">
+      <a href="${fileURL(r.id)}" download title="Download ${esc(f.name)}">${esc(f.name)}</a><span class="size">${fmtSize(f.size)}</span>
+      ${f.viewable ? `<button class="sm" data-act="view">View</button>` : ""}
+      <button class="sm" data-act="upload" title="Replace file">Replace</button>
+      <button class="sm link" data-act="unfile" title="Remove file">✕</button>
+    </td>`;
 }
 
 function render() {
@@ -102,10 +148,11 @@ function render() {
       ? `<tr data-id="${r.id}">${editorCells(r)}</tr>`
       : `<tr data-id="${r.id}">
           <td class="id">${r.id}</td><td>${esc(r.date)}</td><td>${esc(r.name)}</td><td>${esc(r.feature)}</td>
+          ${fileCell(r)}
           <td class="actions"><button data-act="edit">Edit</button> <button class="danger" data-act="delete">Delete</button></td>
         </tr>`;
   }
-  if (!html) html = `<tr><td colspan="5" class="empty">${q ? "No rows match the filter." : "No rows yet — click “Add row”."}</td></tr>`;
+  if (!html) html = `<tr><td colspan="6" class="empty">${q ? "No rows match the filter." : "No rows yet — click “Add row”."}</td></tr>`;
   $("#rows").innerHTML = html;
 
   document.querySelectorAll("th[data-sort]").forEach(th => {
@@ -139,8 +186,57 @@ $("#rows").addEventListener("click", async e => {
       if (!confirm(`Delete row ${id}?`)) return;
       try { await api("DELETE", `/api/rows/${id}`); flash("Deleted", true); await load(); }
       catch (err) { flash(err.message); }
+      break;
+    case "upload": pickFor = id; $("#picker").value = ""; $("#picker").click(); break;
+    case "view":   openViewer(rows.find(r => r.id === id)); break;
+    case "unfile":
+      if (!confirm(`Remove the file from row ${id}?`)) return;
+      try { await api("DELETE", fileURL(id)); flash("File removed", true); await load(); }
+      catch (err) { flash(err.message); }
   }
 });
+
+// ---- upload ----
+$("#picker").addEventListener("change", async () => {
+  const file = $("#picker").files[0], id = pickFor;
+  if (!file || !id) return;
+  const fd = new FormData(); fd.append("file", file);
+  uploading = id; render();
+  try {
+    const res = await fetch(fileURL(id), { method: "PUT", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    flash(`Uploaded ${file.name}`, true);
+  } catch (err) { flash("Upload failed: " + err.message); }
+  uploading = null; await load();
+});
+
+// ---- viewer (in-page frame, or a separate popup window) ----
+let viewing = null;
+function openViewer(r) {
+  if (!r || !r.file || !r.file.viewable) return;
+  viewing = r;
+  $("#vName").textContent = r.file.name;
+  $("#vDownload").href = fileURL(r.id);
+  $("#vDownload").setAttribute("download", "");
+  const src = fileURL(r.id, true);
+  // Images are shown scaled to fit; text in a frame (the server sends it
+  // with a sandboxing Content-Security-Policy).
+  $("#vContent").innerHTML = r.file.type.startsWith("image/")
+    ? `<img src="${src}" alt="${esc(r.file.name)}">`
+    : `<iframe src="${src}" title="${esc(r.file.name)}"></iframe>`;
+  $("#viewer").classList.add("open");
+}
+function closeViewer() { $("#viewer").classList.remove("open"); $("#vContent").innerHTML = ""; viewing = null; }
+$("#vClose").onclick = closeViewer;
+$("#viewer").addEventListener("click", e => { if (e.target.id === "viewer") closeViewer(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && viewing) closeViewer(); });
+$("#vWindow").onclick = () => {
+  if (!viewing) return;
+  const w = window.open(fileURL(viewing.id, true), "fileview" + viewing.id, "popup,width=900,height=700");
+  if (!w) flash("The browser blocked the popup window; use the frame or allow popups for this site.");
+  else closeViewer();
+};
 
 $("#rows").addEventListener("keydown", e => {
   const tr = e.target.closest("tr"); if (!tr || e.target.tagName !== "INPUT") return;

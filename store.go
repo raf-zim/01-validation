@@ -12,15 +12,30 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no CGO), registers "sqlite"
 )
 
-// Row is one record in the table: Date, Name, Feature, ID.
+// Row is one record in the table: Date, Name, Feature, ID, plus an
+// optional attached file (stored in the file BLOB column).
 type Row struct {
-	ID      int64  `json:"id"`
-	Date    string `json:"date"` // YYYY-MM-DD
-	Name    string `json:"name"`
-	Feature string `json:"feature"`
+	ID      int64     `json:"id"`
+	Date    string    `json:"date"` // YYYY-MM-DD
+	Name    string    `json:"name"`
+	Feature string    `json:"feature"`
+	File    *FileInfo `json:"file"` // null when no file is attached
 }
 
-var ErrNotFound = errors.New("row not found")
+// FileInfo describes an attached file; the bytes are fetched separately.
+type FileInfo struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"` // content type the server will serve it as
+	Size     int64  `json:"size"`
+	Viewable bool   `json:"viewable"` // txt/webp/jpg/jpeg/png: can be shown inline
+}
+
+var (
+	ErrNotFound    = errors.New("row not found")
+	ErrNoFile      = errors.New("row has no file")
+	ErrEmptyFile   = ValidationError{"file is empty"}
+	ErrBadFileName = ValidationError{"file name is required"}
+)
 
 const schema = `
 CREATE TABLE IF NOT EXISTS features (
@@ -29,6 +44,16 @@ CREATE TABLE IF NOT EXISTS features (
     name    TEXT NOT NULL,
     feature TEXT NOT NULL
 );`
+
+// fileColumns are added to tables created before attachments existed.
+var fileColumns = []struct{ name, decl string }{
+	{"file", "BLOB"},
+	{"file_name", "TEXT"},
+	{"file_type", "TEXT"},
+	{"file_size", "INTEGER"},
+}
+
+const rowColumns = `id, date, name, feature, file_name, file_type, file_size`
 
 // Store wraps the SQLite database holding the "features" table.
 type Store struct{ db *sql.DB }
@@ -57,7 +82,62 @@ func OpenStore(path, journalMode string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrate adds any missing file columns (ALTER TABLE ... ADD COLUMN keeps
+// existing rows; the new columns start out NULL).
+func migrate(db *sql.DB) error {
+	rs, err := db.Query(`PRAGMA table_info(features)`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rs.Next() {
+		var (
+			cid       int
+			name, typ string
+			notnull   int
+			dflt      sql.NullString
+			pk        int
+		)
+		if err := rs.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rs.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rs.Close()
+	for _, c := range fileColumns {
+		if !have[c.name] {
+			if _, err := db.Exec(`ALTER TABLE features ADD COLUMN ` + c.name + ` ` + c.decl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+type scanner interface{ Scan(dest ...any) error }
+
+func scanRow(sc scanner) (Row, error) {
+	var (
+		r     Row
+		fname sql.NullString
+		ftype sql.NullString
+		fsize sql.NullInt64
+	)
+	if err := sc.Scan(&r.ID, &r.Date, &r.Name, &r.Feature, &fname, &ftype, &fsize); err != nil {
+		return Row{}, err
+	}
+	if fname.Valid && fname.String != "" {
+		r.File = &FileInfo{Name: fname.String, Type: ftype.String, Size: fsize.Int64, Viewable: isViewable(ftype.String)}
+	}
+	return r, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -72,20 +152,82 @@ func (s *Store) JournalMode() (string, error) {
 }
 
 func (s *Store) List() ([]Row, error) {
-	rs, err := s.db.Query(`SELECT id, date, name, feature FROM features ORDER BY id`)
+	// The BLOB itself is never selected here: only its metadata.
+	rs, err := s.db.Query(`SELECT ` + rowColumns + ` FROM features ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rs.Close()
 	out := []Row{}
 	for rs.Next() {
-		var r Row
-		if err := rs.Scan(&r.ID, &r.Date, &r.Name, &r.Feature); err != nil {
+		r, err := scanRow(rs)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rs.Err()
+}
+
+func (s *Store) Get(id int64) (Row, error) {
+	r, err := scanRow(s.db.QueryRow(`SELECT `+rowColumns+` FROM features WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Row{}, ErrNotFound
+	}
+	return r, err
+}
+
+// SetFile attaches (or replaces) the row's file.
+func (s *Store) SetFile(id int64, name string, data []byte) (Row, error) {
+	name = cleanFileName(name)
+	if name == "" {
+		return Row{}, ErrBadFileName
+	}
+	if len(data) == 0 {
+		return Row{}, ErrEmptyFile
+	}
+	ctype := contentTypeFor(name, data)
+	res, err := s.db.Exec(`UPDATE features SET file = ?, file_name = ?, file_type = ?, file_size = ? WHERE id = ?`,
+		data, name, ctype, len(data), id)
+	if err != nil {
+		return Row{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return Row{}, ErrNotFound
+	}
+	return s.Get(id)
+}
+
+// GetFile returns the row's file metadata and bytes.
+func (s *Store) GetFile(id int64) (FileInfo, []byte, error) {
+	var (
+		data  []byte
+		fname sql.NullString
+		ftype sql.NullString
+	)
+	err := s.db.QueryRow(`SELECT file, file_name, file_type FROM features WHERE id = ?`, id).Scan(&data, &fname, &ftype)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FileInfo{}, nil, ErrNotFound
+	}
+	if err != nil {
+		return FileInfo{}, nil, err
+	}
+	if !fname.Valid || fname.String == "" || data == nil {
+		return FileInfo{}, nil, ErrNoFile
+	}
+	return FileInfo{Name: fname.String, Type: ftype.String, Size: int64(len(data)), Viewable: isViewable(ftype.String)}, data, nil
+}
+
+// ClearFile removes the row's file.
+func (s *Store) ClearFile(id int64) error {
+	res, err := s.db.Exec(`UPDATE features SET file = NULL, file_name = NULL, file_type = NULL, file_size = NULL WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) Insert(r Row) (Row, error) {
@@ -104,6 +246,7 @@ func (s *Store) Update(id int64, r Row) (Row, error) {
 	if err := validate(&r); err != nil {
 		return Row{}, err
 	}
+	// Only the three text columns change; an attached file is kept.
 	res, err := s.db.Exec(`UPDATE features SET date = ?, name = ?, feature = ? WHERE id = ?`, r.Date, r.Name, r.Feature, id)
 	if err != nil {
 		return Row{}, err
@@ -111,8 +254,7 @@ func (s *Store) Update(id int64, r Row) (Row, error) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return Row{}, ErrNotFound
 	}
-	r.ID = id
-	return r, nil
+	return s.Get(id)
 }
 
 func (s *Store) Delete(id int64) error {

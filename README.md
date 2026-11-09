@@ -1,7 +1,7 @@
 # Feature Table
 
 A single Go executable that serves a one-page web app for viewing, inserting,
-editing, and deleting rows in a SQLite table with four columns: **ID, Date, Name, Feature**.
+editing, and deleting rows in a SQLite table with four columns: **ID, Date, Name, Feature**. Each row can also hold one attached **file**, stored in a BLOB column.
 
 - The web page is compiled into the binary (`go:embed`), so there is one file to ship.
 - SQLite runs through `modernc.org/sqlite`, a pure-Go driver. The binary is static (no CGO).
@@ -39,7 +39,18 @@ curl.exe http://localhost:8080/api/rows     # the table as JSON
 | POST   | `/api/rows`      | `{"date":"2026-11-08","name":"…","feature":"…"}`  |
 | PUT    | `/api/rows/{id}` | same as POST                                      |
 | DELETE | `/api/rows/{id}` | –                                                 |
+| PUT    | `/api/rows/{id}/file` | `multipart/form-data` with a `file` field: attach or replace (max `MAX_UPLOAD_MB`) |
+| GET    | `/api/rows/{id}/file` | – download (always `attachment`) |
+| GET    | `/api/rows/{id}/file?view=1` | – show inline; only txt, webp, jpg, jpeg and png, otherwise 415 |
+| DELETE | `/api/rows/{id}/file` | – remove the file |
 | GET    | `/healthz`       | – 204 when healthy, 503 during shutdown or if the DB is unreachable |
+
+## File attachments
+
+- **Storage**: the bytes go in the `file` BLOB column of `features`, alongside `file_name`, `file_type` and `file_size`. The columns were added to the existing table on first start, and existing rows kept all their data. `GET /api/rows` returns only the file's name, type, size and whether it can be viewed, never the bytes.
+- **On the page**: the **File** column has Upload, Replace and ✕ (remove), and the file name downloads it. For txt, webp, jpg, jpeg and png there is also a **View** button. It opens the file in a frame on the page, and **Open in window** in that frame opens a separate popup window.
+- **Safety**: a file only counts as viewable if its extension is one of those five *and* its content matches. A `.png` that is really HTML is treated as a download. Everything else is served as `application/octet-stream` with `Content-Disposition: attachment`. Every file response sends `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`, so uploaded content can never run as a web page. File names are reduced to a safe base name.
+- **Limits**: `MAX_UPLOAD_MB` (default 10). Uploads stream straight into memory without temp files. An upload or download gets up to 2 minutes, while the server's short timeouts still apply to every other request.
 
 ## Logging, tracing, health check, shutdown
 
@@ -81,6 +92,7 @@ logs\http-2026-11-10.log
 | `DB_PATH` | `/db/featuretable.db`    |
 | `DB_JOURNAL_MODE` | `DELETE` (`WAL` or `TRUNCATE` also accepted; the app's default outside Docker is `WAL`) |
 | `SHUTDOWN_TIMEOUT` | `30s`           |
+| `MAX_UPLOAD_MB` | `10` |
 | `LOG_DIR` | `/logs` (unset = stdout only) |
 | `LOG_RETENTION_DAYS` | `4`           |
 | `TZ` | `Asia/Jerusalem` (set in compose; decides when midnight is) |
@@ -90,8 +102,9 @@ The SQLite database is the file `.\db\featuretable.db` in the project folder, ma
 ## Files
 
 - `main.go`: HTTP server, routes, middleware (tracing, logging), health check, graceful shutdown, `-healthcheck` flag
+- `file.go`: file upload/download/view endpoints, content-type and file-name rules
 - `rotate.go`: daily log file writer with retention purge
-- `main_test.go`, `rotate_test.go`: unit and integration tests (run during the Docker build)
+- `main_test.go`, `file_test.go`, `rotate_test.go`: unit and integration tests (run during the Docker build)
 - `store.go`: SQLite access for the `features` table
 - `static/index.html`: the single-page UI
 - `Dockerfile`: multi-stage build to a distroless, non-root image
